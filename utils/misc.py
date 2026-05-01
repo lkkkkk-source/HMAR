@@ -423,10 +423,13 @@ def auto_resume_finetune(args: arg_util.Args, pattern='ckpt*.pth') -> Tuple[List
     else:
         info.append(f'[auto_resume] loading base ckpt from @ {all_ckpt[0]} ...')
         ckpt = torch.load(all_ckpt[0], map_location='cpu')
-        if ckpt['trainer'] and ckpt['trainer']['transformer_wo_ddp']:
+        if isinstance(ckpt, dict) and ckpt.get('trainer') and ckpt['trainer'].get('transformer_wo_ddp'):
             base_ckpt = ckpt['trainer']['transformer_wo_ddp']
-        elif ckpt['transformer_wo_ddp']:
+        elif isinstance(ckpt, dict) and ckpt.get('transformer_wo_ddp'):
             base_ckpt = ckpt['transformer_wo_ddp']
+        elif isinstance(ckpt, dict) and any(k.startswith('base_blocks.') or k.startswith('mask_blocks.') for k in ckpt.keys()):
+            info.append('[auto_resume] detected public HMAR state_dict format')
+            base_ckpt = ckpt
         else:
             raise ValueError('[auto_resume] No transformer_wo_ddp found in base ckpt')
         
