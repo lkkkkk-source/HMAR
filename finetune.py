@@ -79,7 +79,8 @@ def build_everything(args: arg_util.Args):
         num_classes=num_classes, depth=args.depth, shared_aln=args.saln, attn_l2_norm=args.anorm,
         flash_if_available=args.fuse, fused_if_available=args.fuse,
         init_adaln=args.aln, init_adaln_gamma=args.alng, init_head=args.hd, init_std=args.ini,
-        n_layers_train=args.n_layers_train
+        n_layers_train=args.n_layers_train,
+        using_block_sparse_attn=False,
     )
     
     vae_ckpt = os.path.join(args.shared_dir_path, 'vae_ch160v4096z32.pth')
