@@ -4,8 +4,8 @@
 # To view a copy of this license, please refer to LICENSE
 
 depth: 16
-bs: 768
-ep: 100
+bs: 64
+ep: 60
 fp16: 1
 alng: 1e-3
 wpe: 0.1
@@ -13,7 +13,7 @@ reweight_loss: True
 loss_reweight_type: "mask_unweighted"
 experiment: hmar-finetune-mask-d16
 base_experiment: hmar-train-d16
-n_layers_train: 8
+n_layers_train: 4
 
 #logging
 log_to_wandb: False
