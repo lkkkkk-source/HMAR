@@ -134,7 +134,7 @@ class MaskTrainer(Trainer):
             Ltail = self.val_loss(logits_BLV.data[:, idx_to_mask_list_plus_1[-1], :].reshape(-1, V), gt_BL[:, idx_to_mask_list_plus_1[-1]].reshape(-1)).item()
             acc_tail = (pred_BL[:, idx_to_mask_list_plus_1[-1]] == gt_BL[:, idx_to_mask_list_plus_1[-1]]).float().mean().item() * 100
 
-            grad_norm = grad_norm.item()
+            grad_norm = grad_norm.item() if grad_norm is not None else 0.0
             metric_lg.update(Lm=Lmean, Ltail=Ltail, Accm=acc_mean, Acct=acc_tail, tnm=grad_norm)
         
         # log to wandb
