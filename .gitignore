@@ -28,3 +28,4 @@ experiments/
 wandb/
 outputs/
 samples*/
+dataset_v3_patches/
