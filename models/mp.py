@@ -66,6 +66,7 @@ class MaskedPrediction(Transformer):
         assert (
             n_layers_train <= self.depth
         ), f"n_layers_train should be less than depth {self.depth}"
+        self.n_layers_train = n_layers_train
 
         # transformer blocks to keep for finetune
         blocks_train = [
@@ -133,7 +134,19 @@ class MaskedPrediction(Transformer):
         cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
         attn_bias = attn_bias.to(dtype=main_type)
 
-        for _, b in enumerate(self.blocks):
+        frozen_block_count = self.depth - self.n_layers_train
+        if frozen_block_count > 0:
+            with torch.no_grad():
+                for b in self.blocks[:frozen_block_count]:
+                    x_BLC = b(
+                        x=x_BLC,
+                        cond_BD=cond_BD_or_gss,
+                        using_block_sparse_attn=self.using_block_sparse_attn,
+                        attn_bias=attn_bias,
+                    )
+            x_BLC = x_BLC.detach()
+
+        for b in self.blocks[frozen_block_count:]:
             x_BLC = b(
                 x=x_BLC,
                 cond_BD=cond_BD_or_gss,
