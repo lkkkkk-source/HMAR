@@ -8,6 +8,7 @@ import re
 import torch
 from typing import Any, Mapping
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from models.vqvae import VQVAE
 from .transformer import Transformer
 from utils.misc import does_not_contain_substrings
@@ -147,15 +148,28 @@ class MaskedPrediction(Transformer):
             x_BLC = x_BLC.detach()
 
         for b in self.blocks[frozen_block_count:]:
-            x_BLC = b(
-                x=x_BLC,
-                cond_BD=cond_BD_or_gss,
-                using_block_sparse_attn=self.using_block_sparse_attn,
-                attn_bias=attn_bias,
-            )
+            if self.training:
+                x_BLC = checkpoint(
+                    self._forward_block,
+                    b,
+                    x_BLC,
+                    cond_BD_or_gss,
+                    attn_bias,
+                    use_reentrant=False,
+                )
+            else:
+                x_BLC = self._forward_block(b, x_BLC, cond_BD_or_gss, attn_bias)
         x_BLC = self.get_logits(x_BLC.float(), cond_BD)
 
         return x_BLC
+
+    def _forward_block(self, block, x_BLC, cond_BD_or_gss, attn_bias):
+        return block(
+            x=x_BLC,
+            cond_BD=cond_BD_or_gss,
+            using_block_sparse_attn=self.using_block_sparse_attn,
+            attn_bias=attn_bias,
+        )
 
     def load_state_dict_with_word_embed(
         self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False
