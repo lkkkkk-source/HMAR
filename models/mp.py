@@ -146,9 +146,23 @@ class MaskedPrediction(Transformer):
     def load_state_dict_with_word_embed(
         self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False
     ):
-        self.load_state_dict(state_dict, strict=strict)
+        current_state = self.state_dict()
+        filtered_state = {}
+        skipped = []
+        for name, param in state_dict.items():
+            if name not in current_state:
+                continue
+            if current_state[name].shape != param.shape:
+                skipped.append((name, tuple(param.shape), tuple(current_state[name].shape)))
+                continue
+            filtered_state[name] = param
+
+        ret = self.load_state_dict(filtered_state, strict=False)
+        if skipped:
+            print(f'[MaskedPrediction.load_state_dict_with_word_embed] skipped shape-mismatched keys: {skipped}')
         for name, param in state_dict.items():
             if "word_embed.weight" in name:
                 self.word_embed.weight.copy_(param)
             if "word_embed.bias" in name:
                 self.word_embed_bias.copy_(param)
+        return ret

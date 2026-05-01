@@ -35,9 +35,26 @@ def build_dataset(
     train_aug, val_aug = transforms.Compose(train_aug), transforms.Compose(val_aug)
     
     # build dataset
-    train_set = DatasetFolder(root=osp.join(data_path, 'train'), loader=pil_loader, extensions=IMG_EXTENSIONS, transform=train_aug)
-    val_set = DatasetFolder(root=osp.join(data_path, 'validate'), loader=pil_loader, extensions=IMG_EXTENSIONS, transform=val_aug)
-    num_classes = 1000
+    train_root = osp.join(data_path, 'train')
+    val_root = None
+    for split_name in ('validate', 'val'):
+        candidate = osp.join(data_path, split_name)
+        if osp.isdir(candidate):
+            val_root = candidate
+            break
+
+    if val_root is None:
+        raise FileNotFoundError(
+            f'No validation split found under {data_path}. Expected "validate" or "val".'
+        )
+
+    train_set = DatasetFolder(root=train_root, loader=pil_loader, extensions=IMG_EXTENSIONS, transform=train_aug)
+    val_set = DatasetFolder(root=val_root, loader=pil_loader, extensions=IMG_EXTENSIONS, transform=val_aug)
+    num_classes = len(train_set.classes)
+    if train_set.classes != val_set.classes:
+        raise ValueError(
+            f'Train/val classes do not match: train={train_set.classes}, val={val_set.classes}'
+        )
     print(f'[Dataset] {len(train_set)=}, {len(val_set)=}, {num_classes=}')
     print_aug(train_aug, '[train]')
     print_aug(val_aug, '[val]')
