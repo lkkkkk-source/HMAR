@@ -250,6 +250,8 @@ class SmoothedValue(object):
         """
         Warning: does not synchronize the deque!
         """
+        if not tdist.is_available() or not tdist.is_initialized():
+            return
         t = torch.tensor([self.count, self.total], dtype=torch.float64, device='cuda')
         tdist.barrier()
         tdist.all_reduce(t)
