@@ -4,8 +4,9 @@
 # To view a copy of this license, please refer to LICENSE
 
 import math
+import re
 import torch
-from typing import Mapping
+from typing import Any, Mapping
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 from models.vqvae import VQVAE
@@ -171,8 +172,11 @@ class MaskedPrediction(Transformer):
         )
 
     def load_state_dict_with_word_embed(
-        self, state_dict: Mapping, strict: bool = True, assign: bool = False
+        self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False
     ):
+        if any(name.startswith("base_blocks.") or name.startswith("mask_blocks.") for name in state_dict):
+            state_dict = self._convert_hmar_state_dict(state_dict)
+
         current_state = self.state_dict()
         filtered_state = {}
         skipped = []
@@ -199,3 +203,36 @@ class MaskedPrediction(Transformer):
             if "word_embed.bias" in name:
                 self.word_embed_bias.copy_(param)
         return ret
+
+    def _convert_hmar_state_dict(self, state_dict: Mapping[str, Any]):
+        converted = {}
+        base_ids = sorted({
+            int(m.group(1))
+            for name in state_dict.keys()
+            for m in [re.match(r"base_blocks\.(\d+)\.", name)]
+            if m is not None
+        })
+        base_offset = len(base_ids)
+
+        for name, param in state_dict.items():
+            if name.startswith("base_blocks."):
+                converted["blocks." + name[len("base_blocks."):]] = param
+            elif name.startswith("mask_blocks."):
+                rest = name[len("mask_blocks."):]
+                block_idx, suffix = rest.split(".", 1)
+                converted[f"blocks.{base_offset + int(block_idx)}.{suffix}"] = param
+            elif name.startswith("mask_head_nm."):
+                converted["head_nm." + name[len("mask_head_nm."):]] = param
+            elif name.startswith("mask_head."):
+                converted["head." + name[len("mask_head."):]] = param
+            elif name in {
+                "class_emb.weight",
+                "pos_start",
+                "pos_1LC",
+                "word_embed.weight",
+                "word_embed_bias",
+                "mask_embed.weight",
+            } or name.startswith("lvl_embed.") or name.startswith("shared_ada_lin."):
+                converted[name] = param
+
+        return converted
