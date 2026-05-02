@@ -73,7 +73,7 @@ class MaskedPrediction(Transformer):
         blocks_train = [
             f"blocks.{i}" for i in range(self.depth - n_layers_train, self.depth)
         ]
-        self.train_params = ["mask_embed", "head"] + blocks_train
+        self.train_params = ["mask_embed", "head", "class_emb"] + blocks_train
 
         # freeze all params except those to be finetuned
         for name, param in self.named_parameters():
