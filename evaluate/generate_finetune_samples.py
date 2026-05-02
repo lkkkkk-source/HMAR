@@ -4,9 +4,11 @@ import shutil
 
 import torch
 import torchvision
+import yaml
 
 from models import build_vae_hmar
-from utils.sampling_arg_util import get_args
+from utils.arg_util import _get_yaml_loader
+from utils.sampling_arg_util import Args
 
 
 PATCH_NUMS = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
@@ -145,10 +147,26 @@ def generate_samples(hmar, out_dir: str, total_samples: int, batch_size: int, cl
     assert idx == total_samples, f"generated {idx} samples, expected {total_samples}"
 
 
+def load_sampling_args(config_name: str):
+    args = Args()
+    loader = _get_yaml_loader()
+    with open(f"config/sample/{config_name}.yaml", "r") as file:
+        config = yaml.load(file, Loader=loader)
+    for key, value in config.items():
+        if hasattr(args, key):
+            setattr(args, key, value)
+
+    args.patch_nums = tuple(map(int, args.pn.replace("-", "_").split("_")))
+    args.set_tf32(args.tf32)
+    args.seed_everything(benchmark=True)
+    return args
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True, help="finetune checkpoint path")
     parser.add_argument("--public_hmar_ckpt", default="hmar-d16.pth")
+    parser.add_argument("--sample_config", default="hmar-d16")
     parser.add_argument("--vae_ckpt", default="vae_ch160v4096z32.pth")
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--total_samples", type=int, required=True)
@@ -169,7 +187,7 @@ def main():
     if sum(class_counts.values()) != args.total_samples:
         raise ValueError("sum(class_counts) must equal total_samples")
 
-    sample_args = get_args(cfg_folder="sample")
+    sample_args = load_sampling_args(args.sample_config)
     device = "cuda"
     torch.set_default_device(device)
     hmar = build_hmar_from_finetune_ckpt(
