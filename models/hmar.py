@@ -7,6 +7,7 @@ import math
 import torch
 from typing import Any, Mapping, Optional, Union, Tuple
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from models.vqvae import VQVAE
 from utils.misc import does_not_contain_substrings
 import dist
@@ -213,11 +214,16 @@ class HMAR(nn.Module):
             n_layers_train <= self.depth
         ), f"n_layers_train should be less than depth {self.depth}"
 
-        # transformer blocks to keep for finetune
-        blocks_train = [
-            f"blocks.{i}" for i in range(self.depth - n_layers_train, self.depth)
-        ]
-        self.train_params = ["mask_embed", "head"] + blocks_train
+        ns_blocks_train = [f"ns_blocks.{i}" for i in range(n_layers_train)]
+        mask_blocks_train = [f"mask_blocks.{i}" for i in range(n_layers_train)]
+        self.train_params = [
+            "mask_embed",
+            "class_emb",
+            "ns_head",
+            "ns_head_nm",
+            "mask_head",
+            "mask_head_nm",
+        ] + ns_blocks_train + mask_blocks_train
         self.n_layers_train = n_layers_train
         # freeze all params except those to be finetuned
         for name, param in self.named_parameters():
@@ -240,6 +246,96 @@ class HMAR(nn.Module):
 
         return x_mask_we
 
+    def _embed_prefix(self, label_B: torch.LongTensor, B: int):
+        label_B = torch.where(
+            torch.rand(B, device=label_B.device) < self.cond_drop_rate,
+            self.num_classes,
+            label_B,
+        )
+        sos = cond_BD = self.class_emb(label_B)
+        sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(
+            B, self.first_l, -1
+        )
+        cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+        return sos, cond_BD, cond_BD_or_gss
+
+    def _run_blocks(self, blocks, x_BLC, cond_BD_or_gss, attn_bias, use_no_grad=False):
+        iterator = blocks
+        if use_no_grad:
+            with torch.no_grad():
+                for b in iterator:
+                    x_BLC = b(
+                        x=x_BLC,
+                        cond_BD=cond_BD_or_gss,
+                        attn_bias=attn_bias,
+                        using_block_sparse_attn=False,
+                    )
+            return x_BLC.detach()
+
+        for b in iterator:
+            if self.training:
+                x_BLC = checkpoint(
+                    self._forward_block,
+                    b,
+                    x_BLC,
+                    cond_BD_or_gss,
+                    attn_bias,
+                    use_reentrant=False,
+                )
+            else:
+                x_BLC = self._forward_block(b, x_BLC, cond_BD_or_gss, attn_bias)
+        return x_BLC
+
+    def _forward_block(self, block, x_BLC, cond_BD_or_gss, attn_bias):
+        return block(
+            x=x_BLC,
+            cond_BD=cond_BD_or_gss,
+            attn_bias=attn_bias,
+            using_block_sparse_attn=False,
+        )
+
+    def forward_ns(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor):
+        B = x_BLCv_wo_first_l.shape[0]
+        with torch.amp.autocast("cuda", enabled=False):
+            sos, cond_BD, cond_BD_or_gss = self._embed_prefix(label_B, B)
+            x_BLC = torch.cat(
+                (sos, self.word_embed(x_BLCv_wo_first_l.float()) + self.word_embed_bias), dim=1
+            )
+            x_BLC += self.lvl_embed(self.lvl_1L.expand(B, -1)) + self.pos_1LC
+
+        attn_bias = self.attn_bias_for_masking
+        temp = x_BLC.new_ones(8, 8)
+        main_type = torch.matmul(temp, temp).dtype
+        x_BLC = x_BLC.to(dtype=main_type)
+        cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
+        attn_bias = attn_bias.to(dtype=main_type)
+
+        x_BLC = self._run_blocks(self.base_blocks, x_BLC, cond_BD_or_gss, attn_bias, use_no_grad=True)
+        x_BLC = self._run_blocks(self.ns_blocks, x_BLC, cond_BD_or_gss, attn_bias, use_no_grad=False)
+        return self.get_ns_logits(x_BLC.float(), cond_BD)
+
+    def forward_mask(
+        self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor, idx_to_mask: torch.Tensor
+    ):
+        B = x_BLCv_wo_first_l.shape[0] // 2
+        with torch.amp.autocast("cuda", enabled=False):
+            sos, cond_BD, cond_BD_or_gss = self._embed_prefix(label_B, B)
+            x_BLC = torch.cat(
+                (sos, self.get_word_embed(x_BLCv_wo_first_l, idx_to_mask)), dim=1
+            )
+            x_BLC += self.lvl_embed(self.lvl_1L.expand(B, -1)) + self.pos_1LC
+
+        attn_bias = self.attn_bias_for_masking
+        temp = x_BLC.new_ones(8, 8)
+        main_type = torch.matmul(temp, temp).dtype
+        x_BLC = x_BLC.to(dtype=main_type)
+        cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
+        attn_bias = attn_bias.to(dtype=main_type)
+
+        x_BLC = self._run_blocks(self.base_blocks, x_BLC, cond_BD_or_gss, attn_bias, use_no_grad=True)
+        x_BLC = self._run_blocks(self.mask_blocks, x_BLC, cond_BD_or_gss, attn_bias, use_no_grad=False)
+        return self.get_mask_logits(x_BLC.float(), cond_BD)
+
     def get_ns_logits(
         self,
         h_or_h_and_residual: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -247,7 +343,7 @@ class HMAR(nn.Module):
     ):
         if not isinstance(h_or_h_and_residual, torch.Tensor):
             h, resi = h_or_h_and_residual  # fused_add_norm must be used
-            h = resi + self.blocks[-1].drop_path(h)
+            h = resi + self.ns_blocks[-1].drop_path(h)
         else:  # fused_add_norm is not used
             h = h_or_h_and_residual
         return self.ns_head(self.ns_head_nm(h.float(), cond_BD).float()).float()
@@ -259,7 +355,7 @@ class HMAR(nn.Module):
     ):
         if not isinstance(h_or_h_and_residual, torch.Tensor):
             h, resi = h_or_h_and_residual  # fused_add_norm must be used
-            h = resi + self.blocks[-1].drop_path(h)
+            h = resi + self.mask_blocks[-1].drop_path(h)
         else:  # fused_add_norm is not used
             h = h_or_h_and_residual
         return self.mask_head(self.mask_head_nm(h.float(), cond_BD).float()).float()
@@ -269,52 +365,10 @@ class HMAR(nn.Module):
         label_B: torch.LongTensor,
         x_BLCv_wo_first_l: torch.Tensor,
         idx_to_mask: torch.Tensor,
-    ) -> torch.Tensor:  # returns logits_BLV
-        """
-        :param label_B: label_B
-        :param x_BLCv_wo_first_l: teacher forcing input (B, self.L-self.first_l, self.Cvae)
-        :idx_to_mask: index to mask
-        :return: logits BLV, V is vocab_size
-        """
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         B = x_BLCv_wo_first_l.shape[0] // 2
-        with torch.amp.autocast('cuda', enabled=False):
-            label_B = torch.where(
-                torch.rand(B, device=label_B.device) < self.cond_drop_rate,
-                self.num_classes,
-                label_B,
-            )
-            sos = cond_BD = self.class_emb(label_B)
-            sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(
-                B, self.first_l, -1
-            )
-
-            x_BLC = torch.cat(
-                (sos, self.get_word_embed(x_BLCv_wo_first_l, idx_to_mask)), dim=1
-            )
-
-            x_BLC += self.lvl_embed(self.lvl_1L.expand(B, -1)) + self.pos_1LC
-
-        attn_bias = self.attn_bias_for_masking
-        cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-
-        # hack: get the dtype if mixed precision is used
-        temp = x_BLC.new_ones(8, 8)
-        main_type = torch.matmul(temp, temp).dtype
-
-        x_BLC = x_BLC.to(dtype=main_type)
-        cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
-        attn_bias = attn_bias.to(dtype=main_type)
-
-        for _, b in enumerate(self.blocks):
-            x_BLC = b(
-                x=x_BLC,
-                cond_BD=cond_BD_or_gss,
-                attn_bias=attn_bias,
-                using_block_sparse_attn=True,
-            )
-        x_BLC = self.get_logits(x_BLC.float(), cond_BD)
-
-        return x_BLC
+        x_ns = x_BLCv_wo_first_l[:B]
+        return self.forward_ns(label_B, x_ns), self.forward_mask(label_B, x_BLCv_wo_first_l, idx_to_mask)
 
     @torch.no_grad()
     def generate(
