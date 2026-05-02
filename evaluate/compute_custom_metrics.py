@@ -79,14 +79,12 @@ def main():
             "FID/KID will still run, but LPIPS/SSIM require equal counts."
         )
 
-    fid_score = fid.compute_fid(args.sample_dir, dataset_name=None, dataset_res=None, dataset_split=None, mode="clean", num_workers=0, dataset_path=args.ref_dirs[0] if len(args.ref_dirs) == 1 else None)
-    kid_score = fid.compute_kid(args.sample_dir, dataset_name=None, dataset_res=None, dataset_split=None, mode="clean", num_workers=0, dataset_path=args.ref_dirs[0] if len(args.ref_dirs) == 1 else None)
-
-    # clean-fid expects a single reference directory. When multiple ref dirs are provided,
-    # we evaluate LPIPS/SSIM by ordered pairing over the flattened file list and FID/KID
-    # against a temporary merged directory prepared by the user.
     if len(args.ref_dirs) != 1:
         raise ValueError("clean-fid path mode expects exactly one merged reference directory. Merge ref dirs first.")
+    ref_dir = args.ref_dirs[0]
+
+    fid_score = fid.compute_fid(args.sample_dir, ref_dir, mode="clean", num_workers=0)
+    kid_score = fid.compute_kid(args.sample_dir, ref_dir, mode="clean", num_workers=0)
 
     ssim_score = _compute_ssim(sample_paths, ref_paths)
     lpips_score = _compute_lpips(sample_paths, ref_paths, args.device)
