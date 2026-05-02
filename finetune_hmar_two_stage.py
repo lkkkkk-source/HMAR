@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 import time
 from functools import partial
@@ -249,6 +250,16 @@ def train_one_ep(ep, args, wdb_lg, ld_or_itrt, iters_train, trainer):
 def run_stage(stage: str, resume_path: str = None):
     args: arg_util.Args = arg_util.init_dist_and_get_args()
     wdb_lg, trainer, iters_train, ld_train, ld_val = build_everything(args, stage=stage, resume_path=resume_path)
+    best_metric = None
+    no_improve_rounds = 0
+
+    def is_better(metric_value, best_value):
+        if best_value is None:
+            return True
+        if args.early_stop_metric.startswith("vacc"):
+            return metric_value > (best_value + args.early_stop_min_delta)
+        return metric_value < (best_value - args.early_stop_min_delta)
+
     for ep in range(args.ep):
         stats, (_, remain_time, finish_time) = train_one_ep(ep, args, wdb_lg, ld_train, iters_train, trainer)
         args.L_mean, args.L_tail, args.acc_mean, args.acc_tail, args.grad_norm = (
@@ -261,11 +272,28 @@ def run_stage(stage: str, resume_path: str = None):
             args.vL_mean, args.vL_tail, args.vacc_mean, args.vacc_tail = (
                 val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail
             )
+            metric_value = getattr(args, args.early_stop_metric)
             if dist.is_master():
                 out_ckpt = os.path.join(args.experiment_dir_path, f"ar-ckpt-last-{stage}.pth")
+                out_ckpt_best = os.path.join(args.experiment_dir_path, f"ar-ckpt-best-{stage}.pth")
                 print(f"[saving ckpt] ...", end="", flush=True)
                 torch.save({"epoch": ep + 1, "iter": 0, "trainer": trainer.state_dict(), "args": args.state_dict()}, out_ckpt)
+                if is_better(metric_value, best_metric):
+                    shutil.copy(out_ckpt, out_ckpt_best)
+                    best_metric = metric_value
+                    no_improve_rounds = 0
+                    print(f" [best {args.early_stop_metric}={metric_value:.4f}]", end="", flush=True)
+                else:
+                    no_improve_rounds += 1
                 print(f"     [saving ckpt](*) finished!  @ {out_ckpt}", flush=True, clean=True)
+            dist.barrier()
+            if args.early_stop_patience > 0 and no_improve_rounds >= args.early_stop_patience:
+                print(
+                    f"[early stop] stage={stage} metric={args.early_stop_metric} "
+                    f"best={best_metric:.4f} patience={args.early_stop_patience}",
+                    flush=True,
+                )
+                break
         args.dump_log()
         wdb_lg.flush()
 

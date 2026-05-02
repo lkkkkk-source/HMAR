@@ -1,0 +1,37 @@
+# Copyright (c) 2025, NVIDIA Corporation. All rights reserved.
+#
+# This work is made available under the NVIDIA One-Way Noncommercial License v1 (NSCLv1).
+# To view a copy of this license, please refer to LICENSE
+
+depth: 16
+
+bs: 32
+ac: 2
+tblr: 4e-5
+ep: 80
+
+fp16: 1
+alng: 1e-3
+wpe: 0.1
+
+reweight_loss: True
+loss_reweight_type: "mask_unweighted"
+
+experiment: hmar-finetune-mask-d16-k8
+base_experiment: hmar-train-d16
+n_layers_train: 8
+
+workers: 2
+fuse: True
+
+# logging
+log_to_wandb: False
+checkpoint_frequency: 5
+log_ckpt_to_wandb_every: 10
+log_imgs_iters: 50
+
+# early stop is evaluated only when validation runs, so patience=4 means
+# four checkpoint intervals without improvement.
+early_stop_patience: 4
+early_stop_min_delta: 0.01
+early_stop_metric: vL_mean

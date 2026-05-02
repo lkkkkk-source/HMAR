@@ -179,6 +179,9 @@ class Args(Tap):
     checkpoint_frequency: int = 10 #save checkpoint every n epochs
     max_num_checkpoints: int = 3 #maximum number of checkpoints to keep
     ckpt_path: str = None #path to the checkpoint to evaluate
+    early_stop_patience: int = 0
+    early_stop_min_delta: float = 0.0
+    early_stop_metric: str = 'vL_mean'
 
     def seed_everything(self, benchmark: bool):
         _seed_everything(self.seed, benchmark)
