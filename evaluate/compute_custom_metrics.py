@@ -1,52 +1,106 @@
 import argparse
+import os
+from typing import List
 
 import numpy as np
-import tensorflow.compat.v1 as tf
+import torch
+from PIL import Image
+from skimage.metrics import structural_similarity
 
-from utils.evaluation import Evaluator, open_npz_array, _compute_metrics
+
+def _list_images_from_dirs(dirs: List[str]):
+    paths = []
+    for split_dir in dirs:
+        for root, _, files in os.walk(split_dir):
+            for name in sorted(files):
+                if name.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".webp")):
+                    paths.append(os.path.join(root, name))
+    return paths
 
 
-def polynomial_mmd_averages(codes_g, codes_r, degree=3, gamma=None, coef0=1.0):
-    if gamma is None:
-        gamma = 1.0 / codes_g.shape[1]
-    k_xx = (gamma * (codes_g @ codes_g.T) + coef0) ** degree
-    k_yy = (gamma * (codes_r @ codes_r.T) + coef0) ** degree
-    k_xy = (gamma * (codes_g @ codes_r.T) + coef0) ** degree
-    n = codes_g.shape[0]
-    m = codes_r.shape[0]
-    sum_xx = (k_xx.sum() - np.trace(k_xx)) / (n * (n - 1))
-    sum_yy = (k_yy.sum() - np.trace(k_yy)) / (m * (m - 1))
-    sum_xy = k_xy.mean()
-    return float(sum_xx + sum_yy - 2.0 * sum_xy)
+def _load_rgb(path: str):
+    with Image.open(path) as img:
+        return np.asarray(img.convert("RGB"), dtype=np.uint8)
+
+
+def _compute_ssim(sample_paths: List[str], ref_paths: List[str]):
+    if len(sample_paths) != len(ref_paths):
+        raise ValueError(f"SSIM expects equal counts, got {len(sample_paths)} samples vs {len(ref_paths)} refs")
+    vals = []
+    for sample_path, ref_path in zip(sample_paths, ref_paths):
+        sample = _load_rgb(sample_path)
+        ref = _load_rgb(ref_path)
+        vals.append(
+            structural_similarity(
+                sample,
+                ref,
+                channel_axis=2,
+                data_range=255,
+            )
+        )
+    return float(np.mean(vals))
+
+
+def _compute_lpips(sample_paths: List[str], ref_paths: List[str], device: str):
+    if len(sample_paths) != len(ref_paths):
+        raise ValueError(f"LPIPS expects equal counts, got {len(sample_paths)} samples vs {len(ref_paths)} refs")
+    import lpips
+
+    loss_fn = lpips.LPIPS(net="alex").to(device)
+    vals = []
+    for sample_path, ref_path in zip(sample_paths, ref_paths):
+        sample = torch.from_numpy(_load_rgb(sample_path)).permute(2, 0, 1).float() / 127.5 - 1.0
+        ref = torch.from_numpy(_load_rgb(ref_path)).permute(2, 0, 1).float() / 127.5 - 1.0
+        sample = sample.unsqueeze(0).to(device)
+        ref = ref.unsqueeze(0).to(device)
+        with torch.inference_mode():
+            vals.append(loss_fn(sample, ref).item())
+    return float(np.mean(vals))
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sample_npz", required=True)
-    parser.add_argument("--ref_npz", required=True)
+    parser.add_argument("--sample_dir", required=True)
+    parser.add_argument("--ref_dirs", nargs="+", required=True)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
-    fid, sfid, is_score, prec, recall = _compute_metrics(args.ref_npz, args.sample_npz)
+    try:
+        from cleanfid import fid
+    except ImportError as e:
+        raise ImportError("Please install clean-fid: pip install clean-fid") from e
 
-    config = tf.ConfigProto(allow_soft_placement=True)
-    evaluator = Evaluator(tf.Session(config=config))
-    evaluator.warmup()
+    sample_paths = _list_images_from_dirs([args.sample_dir])
+    ref_paths = _list_images_from_dirs(args.ref_dirs)
 
-    with open_npz_array(args.sample_npz, "arr_0") as sample_reader:
-        sample_feats, _ = evaluator.compute_activations(sample_reader.read_batches(evaluator.batch_size))
-    with open_npz_array(args.ref_npz, "arr_0") as ref_reader:
-        ref_feats, _ = evaluator.compute_activations(ref_reader.read_batches(evaluator.batch_size))
+    if len(sample_paths) != len(ref_paths):
+        print(
+            f"[compute_custom_metrics] warning: sample/ref counts differ ({len(sample_paths)} vs {len(ref_paths)}). "
+            "FID/KID will still run, but LPIPS/SSIM require equal counts."
+        )
 
-    kid = polynomial_mmd_averages(sample_feats, ref_feats)
+    fid_score = fid.compute_fid(args.sample_dir, dataset_name=None, dataset_res=None, dataset_split=None, mode="clean", num_workers=0, dataset_path=args.ref_dirs[0] if len(args.ref_dirs) == 1 else None)
+    kid_score = fid.compute_kid(args.sample_dir, dataset_name=None, dataset_res=None, dataset_split=None, mode="clean", num_workers=0, dataset_path=args.ref_dirs[0] if len(args.ref_dirs) == 1 else None)
 
-    print({
-        "FID": fid,
-        "sFID": sfid,
-        "IS": is_score,
-        "Precision": prec,
-        "Recall": recall,
-        "KID": kid,
-    })
+    # clean-fid expects a single reference directory. When multiple ref dirs are provided,
+    # we evaluate LPIPS/SSIM by ordered pairing over the flattened file list and FID/KID
+    # against a temporary merged directory prepared by the user.
+    if len(args.ref_dirs) != 1:
+        raise ValueError("clean-fid path mode expects exactly one merged reference directory. Merge ref dirs first.")
+
+    ssim_score = _compute_ssim(sample_paths, ref_paths)
+    lpips_score = _compute_lpips(sample_paths, ref_paths, args.device)
+
+    print(
+        {
+            "FID": float(fid_score),
+            "KID": float(kid_score),
+            "LPIPS": float(lpips_score),
+            "SSIM": float(ssim_score),
+            "num_samples": len(sample_paths),
+            "num_refs": len(ref_paths),
+        }
+    )
 
 
 if __name__ == "__main__":
