@@ -9,13 +9,84 @@ from models import build_vae_hmar
 from utils.sampling_arg_util import get_args
 
 
-def build_hmar_from_finetune_ckpt(checkpoint_path: str, vae_ckpt_path: str, device: str):
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-    trainer_state = ckpt["trainer"]["transformer_wo_ddp"]
+PATCH_NUMS = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
 
-    ns_head_weight = trainer_state["ns_head.weight"]
-    embed_dim = ns_head_weight.shape[1]
+
+def _load_public_hmar_weights(hmar, state_dict):
+    current_state = hmar.state_dict()
+    filtered_state = {}
+    skipped = []
+
+    for name, param in state_dict.items():
+        if name not in current_state:
+            continue
+        if name == "class_emb.weight" and param.shape != current_state[name].shape:
+            current_state[name][-1].copy_(param[-1])
+            skipped.append((name, tuple(param.shape), tuple(current_state[name].shape)))
+            continue
+        if current_state[name].shape != param.shape:
+            skipped.append((name, tuple(param.shape), tuple(current_state[name].shape)))
+            continue
+        filtered_state[name] = param
+
+    ret = hmar.load_state_dict(filtered_state, strict=False)
+    if skipped:
+        print(f"[generate_finetune_samples] skipped public shape-mismatched keys: {skipped}")
+    if ret is not None:
+        missing, unexpected = ret
+        print(f"[generate_finetune_samples] public HMAR missing: {missing}")
+        print(f"[generate_finetune_samples] public HMAR unexpected: {unexpected}")
+
+
+def _apply_finetuned_mask_weights(hmar, trainer_state):
+    n_layers_train = len(hmar.mask_blocks)
+    base_block_count = len(hmar.base_blocks)
+    state = hmar.state_dict()
+
+    for name, param in trainer_state.items():
+        if name.startswith("blocks."):
+            rest = name[len("blocks."):]
+            block_idx_str, suffix = rest.split(".", 1)
+            block_idx = int(block_idx_str)
+            if block_idx >= base_block_count:
+                mask_idx = block_idx - base_block_count
+                if mask_idx < n_layers_train:
+                    state[f"mask_blocks.{mask_idx}.{suffix}"].copy_(param)
+        elif name.startswith("head_nm."):
+            state["mask_head_nm." + name[len("head_nm."):]].copy_(param)
+        elif name.startswith("head."):
+            state["mask_head." + name[len("head."):]].copy_(param)
+        elif name in {
+            "word_embed.weight",
+            "word_embed_bias",
+            "mask_embed.weight",
+            "pos_start",
+            "pos_1LC",
+        }:
+            state[name].copy_(param)
+        elif name.startswith("lvl_embed.") or name.startswith("shared_ada_lin."):
+            state[name].copy_(param)
+        elif name == "class_emb.weight":
+            state[name].copy_(param)
+
+
+def build_hmar_from_finetune_ckpt(checkpoint_path: str, vae_ckpt_path: str, public_hmar_ckpt: str, device: str):
+    finetune_ckpt = torch.load(checkpoint_path, map_location="cpu")
+    trainer_state = finetune_ckpt["trainer"]["transformer_wo_ddp"]
+
+    class_emb_weight = trainer_state["class_emb.weight"]
+    num_classes = class_emb_weight.shape[0] - 1
+
+    head_weight = trainer_state["head.weight"]
+    embed_dim = head_weight.shape[1]
     depth = embed_dim // 64
+
+    trained_block_ids = sorted(
+        int(k.split(".")[1])
+        for k in trainer_state.keys()
+        if k.startswith("blocks.") and k.split(".")[1].isdigit()
+    )
+    n_layers_train = len(set(trained_block_ids))
 
     vae_local, hmar = build_vae_hmar(
         V=4096,
@@ -23,25 +94,26 @@ def build_hmar_from_finetune_ckpt(checkpoint_path: str, vae_ckpt_path: str, devi
         ch=160,
         share_quant_resi=4,
         device=device,
-        patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),
-        num_classes=6,
+        patch_nums=PATCH_NUMS,
+        num_classes=num_classes,
         depth=depth,
         shared_aln=False,
         attn_l2_norm=True,
         flash_if_available=True,
         fused_if_available=True,
-        n_layers_train=4,
+        n_layers_train=n_layers_train,
         using_block_sparse_attn=False,
     )
 
     vae_local.load_state_dict(torch.load(vae_ckpt_path, map_location="cpu"), strict=True)
-    hmar.load_base_and_ns_state_dict(trainer_state)
-    hmar.load_mask_dict(trainer_state)
+    public_state = torch.load(public_hmar_ckpt, map_location="cpu")
+    _load_public_hmar_weights(hmar, public_state)
+    _apply_finetuned_mask_weights(hmar, trainer_state)
     hmar.eval()
     return hmar
 
 
-def generate_samples(hmar, out_dir: str, total_samples: int, batch_size: int, class_counts):
+def generate_samples(hmar, out_dir: str, total_samples: int, batch_size: int, class_counts, sample_args):
     if os.path.exists(out_dir):
         shutil.rmtree(out_dir)
     os.makedirs(out_dir, exist_ok=True)
@@ -58,12 +130,12 @@ def generate_samples(hmar, out_dir: str, total_samples: int, batch_size: int, cl
                     class_id,
                     g_seed=seed_base + idx,
                     num_samples=1,
-                    top_k=1000,
-                    top_p=0.99,
-                    cfg=1.7,
-                    more_smooth=False,
-                    mask=True,
-                    mask_schedule=get_args(cfg_folder="sample").mask_schedule,
+                    top_k=sample_args.top_k,
+                    top_p=sample_args.top_p,
+                    cfg=sample_args.cfg,
+                    more_smooth=sample_args.more_smooth,
+                    mask=sample_args.mask,
+                    mask_schedule=sample_args.mask_schedule,
                 )
                 for j in range(cur_bs):
                     torchvision.utils.save_image(imgs[j], os.path.join(out_dir, f"{idx:06d}.png"))
@@ -76,6 +148,7 @@ def generate_samples(hmar, out_dir: str, total_samples: int, batch_size: int, cl
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True, help="finetune checkpoint path")
+    parser.add_argument("--public_hmar_ckpt", default="hmar-d16.pth")
     parser.add_argument("--vae_ckpt", default="vae_ch160v4096z32.pth")
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--total_samples", type=int, required=True)
@@ -96,10 +169,16 @@ def main():
     if sum(class_counts.values()) != args.total_samples:
         raise ValueError("sum(class_counts) must equal total_samples")
 
+    sample_args = get_args(cfg_folder="sample")
     device = "cuda"
     torch.set_default_device(device)
-    hmar = build_hmar_from_finetune_ckpt(args.checkpoint, args.vae_ckpt, device=device)
-    generate_samples(hmar, args.out_dir, args.total_samples, args.batch_size, class_counts)
+    hmar = build_hmar_from_finetune_ckpt(
+        args.checkpoint,
+        args.vae_ckpt,
+        args.public_hmar_ckpt,
+        device=device,
+    )
+    generate_samples(hmar, args.out_dir, args.total_samples, args.batch_size, class_counts, sample_args)
 
 
 if __name__ == "__main__":
