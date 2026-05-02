@@ -365,10 +365,17 @@ class HMAR(nn.Module):
         label_B: torch.LongTensor,
         x_BLCv_wo_first_l: torch.Tensor,
         idx_to_mask: torch.Tensor,
+        mode: str = "both",
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B = x_BLCv_wo_first_l.shape[0] // 2
         x_ns = x_BLCv_wo_first_l[:B]
-        return self.forward_ns(label_B, x_ns), self.forward_mask(label_B, x_BLCv_wo_first_l, idx_to_mask)
+        if mode == "ns":
+            return self.forward_ns(label_B, x_ns)
+        if mode == "mask":
+            return self.forward_mask(label_B, x_BLCv_wo_first_l, idx_to_mask)
+        if mode == "both":
+            return self.forward_ns(label_B, x_ns), self.forward_mask(label_B, x_BLCv_wo_first_l, idx_to_mask)
+        raise ValueError(f"Unknown HMAR forward mode: {mode}")
 
     @torch.no_grad()
     def generate(

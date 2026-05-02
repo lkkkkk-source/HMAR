@@ -1,9 +1,6 @@
-import gc
 import os
-import shutil
 import sys
 import time
-import warnings
 from functools import partial
 
 import torch
@@ -12,7 +9,7 @@ from torch.utils.data import DataLoader
 
 import dist
 from dist import NullDDP
-from hmar_trainer import HMARTrainer
+from hmar_two_stage_trainer import HMARTwoStageTrainer
 from models import HMAR, VQVAE, build_vae_hmar
 from utils import arg_util, misc
 from utils.amp_sc import AmpOptimizer
@@ -48,7 +45,6 @@ def load_public_hmar_weights(hmar_wo_ddp: HMAR, state_dict):
             skipped.append((name, tuple(param.shape), tuple(current_state[name].shape)))
             continue
         filtered_state[name] = param
-
     ret = hmar_wo_ddp.load_state_dict(filtered_state, strict=False)
     if skipped:
         print(f"[load_public_hmar_weights] skipped shape-mismatched keys: {skipped}")
@@ -58,39 +54,41 @@ def load_public_hmar_weights(hmar_wo_ddp: HMAR, state_dict):
         print(f"[load_public_hmar_weights] unexpected: {unexpected}")
 
 
-def apply_last_k_finetune_policy(hmar_wo_ddp: HMAR, last_k: int):
+def apply_stage_policy(hmar_wo_ddp: HMAR, last_k: int, stage: str):
     for _, param in hmar_wo_ddp.named_parameters():
         param.requires_grad = False
 
     for param in hmar_wo_ddp.class_emb.parameters():
         param.requires_grad = True
-    for param in hmar_wo_ddp.mask_embed.parameters():
-        param.requires_grad = True
     for param in hmar_wo_ddp.word_embed.parameters():
         param.requires_grad = True
     hmar_wo_ddp.word_embed_bias.requires_grad = True
-    for module in (hmar_wo_ddp.ns_head_nm, hmar_wo_ddp.ns_head, hmar_wo_ddp.mask_head_nm, hmar_wo_ddp.mask_head):
-        for param in module.parameters():
+
+    if stage == "ns":
+        for module in (hmar_wo_ddp.ns_head_nm, hmar_wo_ddp.ns_head):
+            for param in module.parameters():
+                param.requires_grad = True
+        for block in list(hmar_wo_ddp.ns_blocks)[-last_k:]:
+            for param in block.parameters():
+                param.requires_grad = True
+    elif stage == "mask":
+        for param in hmar_wo_ddp.mask_embed.parameters():
             param.requires_grad = True
-
-    if last_k > len(hmar_wo_ddp.ns_blocks):
-        raise ValueError(f"Requested last_k={last_k} but HMAR only has {len(hmar_wo_ddp.ns_blocks)} ns/mask blocks")
-
-    for block in list(hmar_wo_ddp.ns_blocks)[-last_k:]:
-        for param in block.parameters():
-            param.requires_grad = True
-    for block in list(hmar_wo_ddp.mask_blocks)[-last_k:]:
-        for param in block.parameters():
-            param.requires_grad = True
+        for module in (hmar_wo_ddp.mask_head_nm, hmar_wo_ddp.mask_head):
+            for param in module.parameters():
+                param.requires_grad = True
+        for block in list(hmar_wo_ddp.mask_blocks)[-last_k:]:
+            for param in block.parameters():
+                param.requires_grad = True
+    else:
+        raise ValueError(f"Unknown stage: {stage}")
 
 
-def build_everything(args: arg_util.Args):
+def build_everything(args: arg_util.Args, stage: str, resume_path: str = None):
     wdb_lg = misc.DistLogger(misc.WandbLogger(args), verbose=True)
-
     print(f"global bs={args.glb_batch_size}, local bs={args.batch_size}")
     print(f"initial args:\n{str(args)}")
 
-    print(f"[build PT data] ...\n")
     num_classes, dataset_train, dataset_val = build_dataset(
         args.data_path, final_reso=args.data_load_reso, hflip=args.hflip, mid_reso=args.mid_reso
     )
@@ -126,12 +124,7 @@ def build_everything(args: arg_util.Args):
     )
     del dataset_train
 
-    print(f"[dataloader multi processing] ...", end="", flush=True)
-    stt = time.time()
-    iters_train = len(ld_train)
-    ld_train = iter(ld_train)
-    print(f"     [dataloader multi processing](*) finished! ({time.time()-stt:.2f}s)", flush=True, clean=True)
-    print(f"[dataloader] gbs={args.glb_batch_size}, lbs={args.batch_size}, iters_train={iters_train}, types(tr, va)={types}")
+    print(f"[dataloader] gbs={args.glb_batch_size}, lbs={args.batch_size}, iters_train={len(ld_train)}, types(tr, va)={types}")
 
     public_hmar_ckpt = os.path.join(args.shared_dir_path, "hmar-d16.pth")
     public_state = torch.load(public_hmar_ckpt, map_location="cpu")
@@ -156,15 +149,17 @@ def build_everything(args: arg_util.Args):
     vae_ckpt = os.path.join(args.shared_dir_path, "vae_ch160v4096z32.pth")
     vae_local.load_state_dict(torch.load(vae_ckpt, map_location="cpu"), strict=True)
     load_public_hmar_weights(hmar_wo_ddp, public_state)
-    apply_last_k_finetune_policy(hmar_wo_ddp, args.n_layers_train)
+
+    if resume_path is not None:
+        ckpt = torch.load(resume_path, map_location="cpu")
+        hmar_wo_ddp.load_state_dict(ckpt["trainer"]["transformer_wo_ddp"], strict=False)
+
+    apply_stage_policy(hmar_wo_ddp, args.n_layers_train, stage)
 
     vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
     hmar_wo_ddp: HMAR = args.compile_model(hmar_wo_ddp, args.tfast)
     hmar: DDP = (DDP if dist.initialized() else NullDDP)(
-        hmar_wo_ddp,
-        device_ids=[dist.get_local_rank()],
-        find_unused_parameters=False,
-        broadcast_buffers=False,
+        hmar_wo_ddp, device_ids=[dist.get_local_rank()], find_unused_parameters=False, broadcast_buffers=False
     )
 
     names, paras, para_groups = filter_params(
@@ -190,10 +185,9 @@ def build_everything(args: arg_util.Args):
         "adam": partial(torch.optim.AdamW, betas=(0.9, 0.95), fused=args.afuse),
         "adamw": partial(torch.optim.AdamW, betas=(0.9, 0.95), fused=args.afuse),
     }[args.opt.lower().strip()]
-    opt_kw = dict(lr=args.tlr, weight_decay=0)
     optimizer = AmpOptimizer(
         mixed_precision=args.fp16,
-        optimizer=opt_clz(params=para_groups, **opt_kw),
+        optimizer=opt_clz(params=para_groups, lr=args.tlr, weight_decay=0),
         names=names,
         paras=paras,
         grad_clip=args.tclip,
@@ -201,7 +195,8 @@ def build_everything(args: arg_util.Args):
     )
     del names, paras, para_groups
 
-    trainer = HMARTrainer(
+    trainer = HMARTwoStageTrainer(
+        stage=stage,
         device=args.device,
         patch_nums=args.patch_nums,
         resos=args.resos,
@@ -213,9 +208,7 @@ def build_everything(args: arg_util.Args):
         reweight_loss=args.reweight_loss,
         loss_reweight_type=args.loss_reweight_type,
     )
-
-    dist.barrier()
-    return wdb_lg, trainer, iters_train, ld_train, ld_val
+    return wdb_lg, trainer, len(ld_train), iter(ld_train), ld_val
 
 
 def train_one_ep(ep, args, wdb_lg, ld_or_itrt, iters_train, trainer):
@@ -227,29 +220,19 @@ def train_one_ep(ep, args, wdb_lg, ld_or_itrt, iters_train, trainer):
     header = f"[Ep]: [{ep:4d}/{args.ep}]"
 
     g_it, max_it = ep * iters_train, args.ep * iters_train
-    print(f"  [*] [training]  {header}  [it]: [1/{iters_train}]", flush=True)
     for it, (inp, label) in me.log_every(0, iters_train, ld_or_itrt, 5, header):
         g_it = ep * iters_train + it
         inp = inp.to(args.device, non_blocking=True)
         label = label.to(args.device, non_blocking=True)
-        args.cur_it = f"{it+1}/{iters_train}"
-
         wp_it = args.wp * iters_train
-        min_tlr, max_tlr, min_twd, max_twd = lr_wd_annealing(
+        _, max_tlr, _, max_twd = lr_wd_annealing(
             args.sche, trainer.optimizer.optimizer, args.tlr, args.twd, args.twde, g_it, wp_it, max_it, wp0=args.wp0, wpe=args.wpe
         )
         args.cur_lr, args.cur_wd = max_tlr, max_twd
         stepping = (g_it + 1) % args.ac == 0
         grad_norm, scale_log2 = trainer.train_step(
-            it=it,
-            g_it=g_it,
-            stepping=stepping,
-            metric_lg=me,
-            wdb_lg=wdb_lg,
-            inp_B3HW=inp,
-            label_B=label,
-            eval_labels=args.eval_classes,
-            log_imgs_iters=args.log_imgs_iters,
+            it=it, g_it=g_it, stepping=stepping, metric_lg=me, wdb_lg=wdb_lg,
+            inp_B3HW=inp, label_B=label, eval_labels=args.eval_classes, log_imgs_iters=args.log_imgs_iters
         )
         me.update(tlr=max_tlr)
         wdb_lg.set_step(step=g_it)
@@ -259,58 +242,39 @@ def train_one_ep(ep, args, wdb_lg, ld_or_itrt, iters_train, trainer):
         if args.tclip > 0:
             wdb_lg.update(head="Optimizer/grad", grad_norm=grad_norm)
             wdb_lg.update(head="Optimizer/grad", grad_clip=args.tclip)
-
     me.synchronize_between_processes()
     return {k: meter.global_avg for k, meter in me.meters.items()}, me.iter_time.time_preds(max_it - (g_it + 1) + (args.ep - ep) * 15)
 
 
-def finetune_hmar():
+def run_stage(stage: str, resume_path: str = None):
     args: arg_util.Args = arg_util.init_dist_and_get_args()
-    wdb_lg, trainer, iters_train, ld_train, ld_val = build_everything(args)
-
-    start_time = time.time()
+    wdb_lg, trainer, iters_train, ld_train, ld_val = build_everything(args, stage=stage, resume_path=resume_path)
     for ep in range(args.ep):
-        wdb_lg.set_step(ep * iters_train)
         stats, (_, remain_time, finish_time) = train_one_ep(ep, args, wdb_lg, ld_train, iters_train, trainer)
         args.L_mean, args.L_tail, args.acc_mean, args.acc_tail, args.grad_norm = (
-            stats["Lm"],
-            stats["Ltail"],
-            stats["Accm"],
-            stats["Acct"],
-            stats["tnm"],
+            stats["Lm"], stats["Ltail"], stats["Accm"], stats["Acct"], stats["tnm"]
         )
         args.cur_ep = f"{ep+1}/{args.ep}"
         args.remain_time, args.finish_time = remain_time, finish_time
-
         if (ep + 1) % args.checkpoint_frequency == 0 or (ep + 1) == args.ep:
             val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, val_loss_resos, acc_resos, tot, cost = trainer.eval_ep(ld_val)
             args.vL_mean, args.vL_tail, args.vacc_mean, args.vacc_tail = (
-                val_loss_mean,
-                val_loss_tail,
-                val_acc_mean,
-                val_acc_tail,
+                val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail
             )
             if dist.is_master():
-                out_ckpt = os.path.join(args.experiment_dir_path, "ar-ckpt-last.pth")
+                out_ckpt = os.path.join(args.experiment_dir_path, f"ar-ckpt-last-{stage}.pth")
                 print(f"[saving ckpt] ...", end="", flush=True)
-                torch.save(
-                    {"epoch": ep + 1, "iter": 0, "trainer": trainer.state_dict(), "args": args.state_dict()},
-                    out_ckpt,
-                )
+                torch.save({"epoch": ep + 1, "iter": 0, "trainer": trainer.state_dict(), "args": args.state_dict()}, out_ckpt)
                 print(f"     [saving ckpt](*) finished!  @ {out_ckpt}", flush=True, clean=True)
-                delete_old_ckpts(args.experiment_dir_path, "ar-ckpt-epoch-*.pth", args.max_num_checkpoints)
-            dist.barrier()
-
         args.dump_log()
         wdb_lg.flush()
 
-    print(f"[HMAR finetune finished] Total cost: {(time.time() - start_time) / 3600:.1f}h")
-    wdb_lg.close()
-
 
 if __name__ == "__main__":
+    stage = os.environ.get("HMAR_STAGE", "ns")
+    resume_path = os.environ.get("HMAR_RESUME", None)
     try:
-        finetune_hmar()
+        run_stage(stage, resume_path)
     finally:
         dist.finalize()
         if isinstance(sys.stdout, misc.SyncPrint) and isinstance(sys.stderr, misc.SyncPrint):
