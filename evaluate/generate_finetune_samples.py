@@ -72,6 +72,14 @@ def _apply_finetuned_mask_weights(hmar, trainer_state):
             state[name].copy_(param)
 
 
+def _load_full_hmar_checkpoint(hmar, trainer_state):
+    ret = hmar.load_state_dict(trainer_state, strict=False)
+    if ret is not None:
+        missing, unexpected = ret
+        print(f"[generate_finetune_samples] full HMAR missing: {missing}")
+        print(f"[generate_finetune_samples] full HMAR unexpected: {unexpected}")
+
+
 def build_hmar_from_finetune_ckpt(checkpoint_path: str, vae_ckpt_path: str, public_hmar_ckpt: str, device: str):
     finetune_ckpt = torch.load(checkpoint_path, map_location="cpu")
     trainer_state = finetune_ckpt["trainer"]["transformer_wo_ddp"]
@@ -80,7 +88,15 @@ def build_hmar_from_finetune_ckpt(checkpoint_path: str, vae_ckpt_path: str, publ
     class_emb_weight = trainer_state["class_emb.weight"]
     num_classes = class_emb_weight.shape[0] - 1
 
-    head_weight = trainer_state["head.weight"]
+    if "head.weight" in trainer_state:
+        head_weight = trainer_state["head.weight"]
+        checkpoint_style = "masked_prediction"
+    elif "ns_head.weight" in trainer_state:
+        head_weight = trainer_state["ns_head.weight"]
+        checkpoint_style = "full_hmar"
+    else:
+        raise KeyError("Could not infer checkpoint style from trainer_state")
+
     embed_dim = head_weight.shape[1]
     depth = embed_dim // 64
 
@@ -112,7 +128,10 @@ def build_hmar_from_finetune_ckpt(checkpoint_path: str, vae_ckpt_path: str, publ
 
     vae_local.load_state_dict(torch.load(vae_ckpt_path, map_location="cpu"), strict=True)
     _load_public_hmar_weights(hmar, public_state)
-    _apply_finetuned_mask_weights(hmar, trainer_state)
+    if checkpoint_style == "masked_prediction":
+        _apply_finetuned_mask_weights(hmar, trainer_state)
+    else:
+        _load_full_hmar_checkpoint(hmar, trainer_state)
     hmar.eval()
     return hmar
 
