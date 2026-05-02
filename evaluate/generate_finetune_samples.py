@@ -75,6 +75,7 @@ def _apply_finetuned_mask_weights(hmar, trainer_state):
 def build_hmar_from_finetune_ckpt(checkpoint_path: str, vae_ckpt_path: str, public_hmar_ckpt: str, device: str):
     finetune_ckpt = torch.load(checkpoint_path, map_location="cpu")
     trainer_state = finetune_ckpt["trainer"]["transformer_wo_ddp"]
+    public_state = torch.load(public_hmar_ckpt, map_location="cpu")
 
     class_emb_weight = trainer_state["class_emb.weight"]
     num_classes = class_emb_weight.shape[0] - 1
@@ -83,12 +84,14 @@ def build_hmar_from_finetune_ckpt(checkpoint_path: str, vae_ckpt_path: str, publ
     embed_dim = head_weight.shape[1]
     depth = embed_dim // 64
 
-    trained_block_ids = sorted(
+    ns_block_ids = {
         int(k.split(".")[1])
-        for k in trainer_state.keys()
-        if k.startswith("blocks.") and k.split(".")[1].isdigit()
-    )
-    n_layers_train = len(set(trained_block_ids))
+        for k in public_state.keys()
+        if k.startswith("ns_blocks.") and k.split(".")[1].isdigit()
+    }
+    if not ns_block_ids:
+        raise ValueError("Could not infer HMAR n_layers_train from public checkpoint")
+    n_layers_train = max(ns_block_ids) + 1
 
     vae_local, hmar = build_vae_hmar(
         V=4096,
@@ -108,7 +111,6 @@ def build_hmar_from_finetune_ckpt(checkpoint_path: str, vae_ckpt_path: str, publ
     )
 
     vae_local.load_state_dict(torch.load(vae_ckpt_path, map_location="cpu"), strict=True)
-    public_state = torch.load(public_hmar_ckpt, map_location="cpu")
     _load_public_hmar_weights(hmar, public_state)
     _apply_finetuned_mask_weights(hmar, trainer_state)
     hmar.eval()
