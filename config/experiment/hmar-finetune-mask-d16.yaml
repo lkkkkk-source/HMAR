@@ -7,7 +7,7 @@ depth: 16
 bs: 64
 ac: 2
 tblr: 4e-5
-ep: 60
+ep: 30
 fp16: 1
 alng: 1e-3
 wpe: 0.1
