@@ -5,6 +5,8 @@
 
 depth: 16
 bs: 64
+ac: 2
+tblr: 4e-5
 ep: 60
 fp16: 1
 alng: 1e-3
@@ -15,8 +17,11 @@ experiment: hmar-finetune-mask-d16
 base_experiment: hmar-train-d16
 n_layers_train: 4
 
+workers: 2
+fuse: True
+
 #logging
 log_to_wandb: False
-checkpoint_frequency: 10
+checkpoint_frequency: 5
 log_ckpt_to_wandb_every: 10
 log_imgs_iters: 10
